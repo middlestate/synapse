@@ -483,7 +483,7 @@ def run(hs):
 
         # We wait 5 minutes to send the first set of stats as the server can
         # be quite busy the first few minutes
-        clock.call_later(5 * 60, phone_stats_home)
+        clock.call_later(1 * 60, phone_stats_home)
 
     if hs.config.daemonize and hs.config.print_pidfile:
         print (hs.config.pid_file)
