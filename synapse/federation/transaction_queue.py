@@ -295,6 +295,7 @@ class TransactionQueue(object):
         Args:
             states (list(UserPresenceState))
         """
+        logger.info("Presence updates: %s", states)
 
         # First we queue up the new presence by user ID, so multiple presence
         # updates in quick successtion are correctly handled
@@ -347,6 +348,17 @@ class TransactionQueue(object):
                 ).update({
                     state.user_id: state for state in states
                 })
+
+                logger.debug(
+                    "Pending presence for %s now %s",
+                    destination,
+                    self.pending_presence_by_dest[destination],
+                )
+
+                logger.debug(
+                    "Attempting new transaction for %s",
+                    destination
+                )
 
                 self._attempt_new_transaction(destination)
 

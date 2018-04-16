@@ -447,7 +447,9 @@ class EventCreationHandler(object):
             event_dict (dict): An entire event
             token_id (str)
             txn_id (str)
-            prev_event_ids (list): The prev event ids to use when creating the event
+            prev_event_ids (list[str]|None):
+                The prev event ids to use when creating the event. If None, we
+                use the latest events in the room.
 
         Returns:
             Tuple of created event (FrozenEvent), Context
