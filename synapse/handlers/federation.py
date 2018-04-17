@@ -15,8 +15,14 @@
 # limitations under the License.
 
 """Contains handlers for federation events."""
+
+import httplib
+import itertools
+import logging
+
 from signedjson.key import decode_verify_key_bytes
 from signedjson.sign import verify_signed_json
+from twisted.internet import defer
 from unpaddedbase64 import decode_base64
 
 from ._base import BaseHandler
@@ -43,10 +49,6 @@ from synapse.util.retryutils import NotRetryingDestination
 
 from synapse.util.distributor import user_joined_room
 
-from twisted.internet import defer
-
-import itertools
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,19 @@ class FederationHandler(BaseHandler):
         if already_seen:
             logger.debug("Already seen pdu %s", pdu.event_id)
             return
+
+        # do some initial sanity-checking of the event. In particular, make
+        # sure it doesn't have hundreds of prev_events or auth_events, which
+        # could cause a huge state resolution or cascade of event fetches.
+        try:
+            self._sanity_check_event(pdu)
+        except SynapseError as err:
+            raise FederationError(
+                "ERROR",
+                err.code,
+                err.msg,
+                affected=pdu.event_id,
+            )
 
         # If we are currently in the process of joining this room, then we
         # queue up events for later processing.
@@ -527,9 +542,16 @@ class FederationHandler(BaseHandler):
     def backfill(self, dest, room_id, limit, extremities):
         """ Trigger a backfill request to `dest` for the given `room_id`
 
-        This will attempt to get more events from the remote. This may return
-        be successfull and still return no events if the other side has no new
-        events to offer.
+        This will attempt to get more events from the remote. If the other side
+        has no new events to offer, this will return an empty list.
+
+        As the events are received, we check their signatures, and also do some
+        sanity-checking on them. If any of the backfilled events are invalid,
+        this method throws a SynapseError.
+
+        TODO: make this more useful to distinguish failures of the remote
+        server from invalid events (there is probably no point in trying to
+        re-fetch invalid events from every other HS in the room.)
         """
         if dest == self.server_name:
             raise SynapseError(400, "Can't backfill from self.")
@@ -540,6 +562,11 @@ class FederationHandler(BaseHandler):
             limit=limit,
             extremities=extremities,
         )
+
+        # do some sanity-checking of the received events, before we go and
+        # do state resolution across 1000 events.
+        for ev in events:
+            self._sanity_check_event(ev)
 
         # Don't bother processing events we already have.
         seen_events = yield self.store.have_events_in_timeline(
@@ -842,6 +869,39 @@ class FederationHandler(BaseHandler):
             tried_domains.update(likely_domains)
 
         defer.returnValue(False)
+
+    def _sanity_check_event(self, ev):
+        """
+        Do some early sanity checks of a received event
+
+        In particular, checks it doesn't have an excessive number of
+        prev_events or auth_events, which could cause a huge state resolution
+        or cascade of event fetches.
+
+        Args:
+            ev (synapse.events.EventBase): event to be checked
+
+        Returns: None
+
+        Raises:
+            SynapseError if the event does not pass muster
+        """
+        if len(ev.prev_events) > 20:
+            logger.warn("Rejecting event %s which has %i prev_events",
+                        ev.event_id, len(ev.prev_events))
+            raise SynapseError(
+                httplib.BAD_REQUEST,
+                "Too many prev_events",
+            )
+
+        if len(ev.auth_events) > 10:
+            logger.warn("Rejecting event %s which has %i auth_events",
+                        ev.event_id, len(ev.auth_events))
+            raise SynapseError(
+                "ERROR",
+                httplib.BAD_REQUEST,
+                "Too many auth_events",
+            )
 
     @defer.inlineCallbacks
     def send_invite(self, target_host, event):
