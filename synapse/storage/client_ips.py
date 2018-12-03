@@ -15,13 +15,15 @@
 
 import logging
 
-from twisted.internet import defer, reactor
+from six import iteritems
 
-from ._base import Cache
-from . import background_updates
+from twisted.internet import defer
 
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.util.caches import CACHE_SIZE_FACTOR
 
+from . import background_updates
+from ._base import Cache
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,7 @@ LAST_SEEN_GRANULARITY = 120 * 1000
 
 class ClientIpStore(background_updates.BackgroundUpdateStore):
     def __init__(self, db_conn, hs):
+
         self.client_ip_last_seen = Cache(
             name="client_ip_last_seen",
             keylen=4,
@@ -55,14 +58,24 @@ class ClientIpStore(background_updates.BackgroundUpdateStore):
             columns=["user_id", "last_seen"],
         )
 
+        self.register_background_index_update(
+            "user_ips_last_seen_only_index",
+            index_name="user_ips_last_seen_only",
+            table="user_ips",
+            columns=["last_seen"],
+        )
+
         # (user_id, access_token, ip) -> (user_agent, device_id, last_seen)
         self._batch_row_update = {}
 
         self._client_ip_looper = self._clock.looping_call(
             self._update_client_ips_batch, 5 * 1000
         )
-        reactor.addSystemEventTrigger("before", "shutdown", self._update_client_ips_batch)
+        self.hs.get_reactor().addSystemEventTrigger(
+            "before", "shutdown", self._update_client_ips_batch
+        )
 
+    @defer.inlineCallbacks
     def insert_client_ip(self, user_id, access_token, ip, user_agent, device_id,
                          now=None):
         if not now:
@@ -73,7 +86,7 @@ class ClientIpStore(background_updates.BackgroundUpdateStore):
             last_seen = self.client_ip_last_seen.get(key)
         except KeyError:
             last_seen = None
-
+        yield self.populate_monthly_active_users(user_id)
         # Rate-limited inserts
         if last_seen is not None and (now - last_seen) < LAST_SEEN_GRANULARITY:
             return
@@ -83,33 +96,48 @@ class ClientIpStore(background_updates.BackgroundUpdateStore):
         self._batch_row_update[key] = (user_agent, device_id, now)
 
     def _update_client_ips_batch(self):
-        to_update = self._batch_row_update
-        self._batch_row_update = {}
-        return self.runInteraction(
-            "_update_client_ips_batch", self._update_client_ips_batch_txn, to_update
+
+        # If the DB pool has already terminated, don't try updating
+        if not self.hs.get_db_pool().running:
+            return
+
+        def update():
+            to_update = self._batch_row_update
+            self._batch_row_update = {}
+            return self.runInteraction(
+                "_update_client_ips_batch", self._update_client_ips_batch_txn,
+                to_update,
+            )
+
+        return run_as_background_process(
+            "update_client_ips", update,
         )
 
     def _update_client_ips_batch_txn(self, txn, to_update):
         self.database_engine.lock_table(txn, "user_ips")
 
-        for entry in to_update.iteritems():
+        for entry in iteritems(to_update):
             (user_id, access_token, ip), (user_agent, device_id, last_seen) = entry
 
-            self._simple_upsert_txn(
-                txn,
-                table="user_ips",
-                keyvalues={
-                    "user_id": user_id,
-                    "access_token": access_token,
-                    "ip": ip,
-                    "user_agent": user_agent,
-                    "device_id": device_id,
-                },
-                values={
-                    "last_seen": last_seen,
-                },
-                lock=False,
-            )
+            try:
+                self._simple_upsert_txn(
+                    txn,
+                    table="user_ips",
+                    keyvalues={
+                        "user_id": user_id,
+                        "access_token": access_token,
+                        "ip": ip,
+                        "user_agent": user_agent,
+                        "device_id": device_id,
+                    },
+                    values={
+                        "last_seen": last_seen,
+                    },
+                    lock=False,
+                )
+            except Exception as e:
+                # Failed to upsert, log and continue
+                logger.error("Failed to insert client IP %r: %r", entry, e)
 
     @defer.inlineCallbacks
     def get_last_client_ip_by_device(self, user_id, device_id):
@@ -224,5 +252,5 @@ class ClientIpStore(background_updates.BackgroundUpdateStore):
                 "user_agent": user_agent,
                 "last_seen": last_seen,
             }
-            for (access_token, ip), (user_agent, last_seen) in results.iteritems()
+            for (access_token, ip), (user_agent, last_seen) in iteritems(results)
         ))

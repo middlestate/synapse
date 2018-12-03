@@ -14,12 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
+from six import iteritems
+
 from twisted.internet import defer
 
-from synapse.api.errors import SynapseError
+from synapse.api.errors import HttpResponseException, SynapseError
 from synapse.types import get_domain_from_id
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +37,23 @@ def _create_rerouter(func_name):
             )
         else:
             destination = get_domain_from_id(group_id)
-            return getattr(self.transport_client, func_name)(
+            d = getattr(self.transport_client, func_name)(
                 destination, group_id, *args, **kwargs
             )
+
+            # Capture errors returned by the remote homeserver and
+            # re-throw specific errors as SynapseErrors. This is so
+            # when the remote end responds with things like 403 Not
+            # In Group, we can communicate that to the client instead
+            # of a 500.
+            def h(failure):
+                failure.trap(HttpResponseException)
+                e = failure.value
+                if e.code == 403:
+                    raise e.to_synapse_error()
+                return failure
+            d.addErrback(h)
+            return d
     return f
 
 
@@ -449,7 +465,7 @@ class GroupsLocalHandler(object):
 
         results = {}
         failed_results = []
-        for destination, dest_user_ids in destinations.iteritems():
+        for destination, dest_user_ids in iteritems(destinations):
             try:
                 r = yield self.transport_client.bulk_get_publicised_groups(
                     destination, list(dest_user_ids),

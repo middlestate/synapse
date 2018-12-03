@@ -18,14 +18,19 @@ import logging
 
 from twisted.internet import defer
 
+from synapse import types
 from synapse.api.errors import (
-    AuthError, Codes, SynapseError, RegistrationError, InvalidCaptchaError
+    AuthError,
+    Codes,
+    InvalidCaptchaError,
+    RegistrationError,
+    SynapseError,
 )
 from synapse.http.client import CaptchaServerHttpClient
-from synapse import types
-from synapse.types import UserID, create_requester, RoomID, RoomAlias
-from synapse.util.async import run_on_reactor, Linearizer
+from synapse.types import RoomAlias, RoomID, UserID, create_requester
+from synapse.util.async_helpers import Linearizer
 from synapse.util.threepids import check_3pid_allowed
+
 from ._base import BaseHandler
 
 logger = logging.getLogger(__name__)
@@ -34,8 +39,13 @@ logger = logging.getLogger(__name__)
 class RegistrationHandler(BaseHandler):
 
     def __init__(self, hs):
-        super(RegistrationHandler, self).__init__(hs)
+        """
 
+        Args:
+            hs (synapse.server.HomeServer):
+        """
+        super(RegistrationHandler, self).__init__(hs)
+        self.hs = hs
         self.auth = hs.get_auth()
         self._auth_handler = hs.get_auth_handler()
         self.profile_handler = hs.get_profile_handler()
@@ -49,6 +59,7 @@ class RegistrationHandler(BaseHandler):
         self._generate_user_id_linearizer = Linearizer(
             name="_generate_user_id_linearizer",
         )
+        self._server_notices_mxid = hs.config.server_notices_mxid
 
     @defer.inlineCallbacks
     def check_username(self, localpart, guest_access_token=None,
@@ -114,13 +125,14 @@ class RegistrationHandler(BaseHandler):
         guest_access_token=None,
         make_guest=False,
         admin=False,
+        threepid=None,
     ):
         """Registers a new client on the server.
 
         Args:
             localpart : The local part of the user ID to register. If None,
               one will be generated.
-            password (str) : The password to assign to this user so they can
+            password (unicode) : The password to assign to this user so they can
               login again. This can be None which means they cannot login again
               via a password (e.g. the user is an application service user).
             generate_token (bool): Whether a new access token should be
@@ -133,7 +145,8 @@ class RegistrationHandler(BaseHandler):
         Raises:
             RegistrationError if there was a problem registering.
         """
-        yield run_on_reactor()
+
+        yield self.auth.check_auth_blocking(threepid=threepid)
         password_hash = None
         if password:
             password_hash = yield self.auth_handler().hash(password)
@@ -207,15 +220,42 @@ class RegistrationHandler(BaseHandler):
 
         # auto-join the user to any rooms we're supposed to dump them into
         fake_requester = create_requester(user_id)
+
+        # try to create the room if we're the first user on the server
+        should_auto_create_rooms = False
+        if self.hs.config.autocreate_auto_join_rooms:
+            count = yield self.store.count_all_users()
+            should_auto_create_rooms = count == 1
+
         for r in self.hs.config.auto_join_rooms:
             try:
-                yield self._join_user_to_room(fake_requester, r)
+                if should_auto_create_rooms:
+                    room_alias = RoomAlias.from_string(r)
+                    if self.hs.hostname != room_alias.domain:
+                        logger.warning(
+                            'Cannot create room alias %s, '
+                            'it does not match server domain',
+                            r,
+                        )
+                    else:
+                        # create room expects the localpart of the room alias
+                        room_alias_localpart = room_alias.localpart
+
+                        # getting the RoomCreationHandler during init gives a dependency
+                        # loop
+                        yield self.hs.get_room_creation_handler().create_room(
+                            fake_requester,
+                            config={
+                                "preset": "public_chat",
+                                "room_alias_name": room_alias_localpart
+                            },
+                            ratelimit=False,
+                        )
+                else:
+                    yield self._join_user_to_room(fake_requester, r)
             except Exception as e:
                 logger.error("Failed to join new user to %r: %r", r, e)
 
-        # We used to generate default identicons here, but nowadays
-        # we want clients to generate their own as part of their branding
-        # rather than there being consistent matrix-wide ones, so we don't.
         defer.returnValue((user_id, token))
 
     @defer.inlineCallbacks
@@ -278,6 +318,7 @@ class RegistrationHandler(BaseHandler):
                 400,
                 "User ID can only contain characters a-z, 0-9, or '=_-./'",
             )
+        yield self.auth.check_auth_blocking()
         user = UserID(localpart, self.hs.hostname)
         user_id = user.to_string()
 
@@ -338,6 +379,14 @@ class RegistrationHandler(BaseHandler):
             yield identity_handler.bind_threepid(c, user_id)
 
     def check_user_id_not_appservice_exclusive(self, user_id, allowed_appservice=None):
+        # don't allow people to register the server notices mxid
+        if self._server_notices_mxid is not None:
+            if user_id == self._server_notices_mxid:
+                raise SynapseError(
+                    400, "This user ID is reserved.",
+                    errcode=Codes.EXCLUSIVE
+                )
+
         # valid user IDs must not clash with any user ID namespaces claimed by
         # application services.
         services = self.store.get_app_services()
@@ -417,11 +466,9 @@ class RegistrationHandler(BaseHandler):
         Raises:
             RegistrationError if there was a problem registering.
         """
-        yield run_on_reactor()
-
         if localpart is None:
             raise SynapseError(400, "Request must include user id")
-
+        yield self.auth.check_auth_blocking()
         need_register = True
 
         try:
@@ -514,4 +561,5 @@ class RegistrationHandler(BaseHandler):
             room_id=room_id,
             remote_room_hosts=remote_room_hosts,
             action="join",
+            ratelimit=False,
         )

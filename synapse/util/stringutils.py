@@ -16,22 +16,36 @@
 import random
 import string
 
+from six import PY3
+from six.moves import range
+
 _string_with_symbols = (
     string.digits + string.ascii_letters + ".,;:^&*-_+=#~@"
 )
 
 
 def random_string(length):
-    return ''.join(random.choice(string.ascii_letters) for _ in xrange(length))
+    return ''.join(random.choice(string.ascii_letters) for _ in range(length))
 
 
 def random_string_with_symbols(length):
     return ''.join(
-        random.choice(_string_with_symbols) for _ in xrange(length)
+        random.choice(_string_with_symbols) for _ in range(length)
     )
 
 
 def is_ascii(s):
+
+    if PY3:
+        if isinstance(s, bytes):
+            try:
+                s.decode('ascii').encode('ascii')
+            except UnicodeDecodeError:
+                return False
+            except UnicodeEncodeError:
+                return False
+            return True
+
     try:
         s.encode("ascii")
     except UnicodeEncodeError:
@@ -47,6 +61,9 @@ def to_ascii(s):
 
     If given None then will return None.
     """
+    if PY3:
+        return s
+
     if s is None:
         return None
 

@@ -13,21 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from twisted.internet import defer
-
-from ._base import BaseHandler
-
-from synapse.api.constants import Membership, EventTypes
-from synapse.api.filtering import Filter
-from synapse.api.errors import SynapseError
-from synapse.events.utils import serialize_event
-from synapse.visibility import filter_events_for_client
-
-from unpaddedbase64 import decode_base64, encode_base64
-
 import itertools
 import logging
 
+from unpaddedbase64 import decode_base64, encode_base64
+
+from twisted.internet import defer
+
+from synapse.api.constants import EventTypes, Membership
+from synapse.api.errors import SynapseError
+from synapse.api.filtering import Filter
+from synapse.events.utils import serialize_event
+from synapse.storage.state import StateFilter
+from synapse.visibility import filter_events_for_client
+
+from ._base import BaseHandler
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class SearchHandler(BaseHandler):
         batch_token = None
         if batch:
             try:
-                b = decode_base64(batch)
+                b = decode_base64(batch).decode('ascii')
                 batch_group, batch_group_key, batch_token = b.split("\n")
 
                 assert batch_group is not None
@@ -63,6 +63,13 @@ class SearchHandler(BaseHandler):
                 assert batch_token is not None
             except Exception:
                 raise SynapseError(400, "Invalid batch")
+
+        logger.info(
+            "Search batch properties: %r, %r, %r",
+            batch_group, batch_group_key, batch_token,
+        )
+
+        logger.info("Search content: %s", content)
 
         try:
             room_cat = content["search_categories"]["room_events"]
@@ -252,24 +259,26 @@ class SearchHandler(BaseHandler):
                 # it returns more from the same group (if applicable) rather
                 # than reverting to searching all results again.
                 if batch_group and batch_group_key:
-                    global_next_batch = encode_base64("%s\n%s\n%s" % (
+                    global_next_batch = encode_base64(("%s\n%s\n%s" % (
                         batch_group, batch_group_key, pagination_token
-                    ))
+                    )).encode('ascii'))
                 else:
-                    global_next_batch = encode_base64("%s\n%s\n%s" % (
+                    global_next_batch = encode_base64(("%s\n%s\n%s" % (
                         "all", "", pagination_token
-                    ))
+                    )).encode('ascii'))
 
                 for room_id, group in room_groups.items():
-                    group["next_batch"] = encode_base64("%s\n%s\n%s" % (
+                    group["next_batch"] = encode_base64(("%s\n%s\n%s" % (
                         "room_id", room_id, pagination_token
-                    ))
+                    )).encode('ascii'))
 
             allowed_events.extend(room_events)
 
         else:
             # We should never get here due to the guard earlier.
             raise NotImplementedError()
+
+        logger.info("Found %d events to return", len(allowed_events))
 
         # If client has asked for "context" for each event (i.e. some surrounding
         # events and state), fetch that
@@ -279,7 +288,12 @@ class SearchHandler(BaseHandler):
             contexts = {}
             for event in allowed_events:
                 res = yield self.store.get_events_around(
-                    event.room_id, event.event_id, before_limit, after_limit
+                    event.room_id, event.event_id, before_limit, after_limit,
+                )
+
+                logger.info(
+                    "Context for search returned %d and %d events",
+                    len(res["events_before"]), len(res["events_after"]),
                 )
 
                 res["events_before"] = yield filter_events_for_client(
@@ -311,9 +325,12 @@ class SearchHandler(BaseHandler):
                     else:
                         last_event_id = event.event_id
 
+                    state_filter = StateFilter.from_types(
+                        [(EventTypes.Member, sender) for sender in senders]
+                    )
+
                     state = yield self.store.get_state_for_event(
-                        last_event_id,
-                        types=[(EventTypes.Member, sender) for sender in senders]
+                        last_event_id, state_filter
                     )
 
                     res["profile_info"] = {
@@ -348,7 +365,7 @@ class SearchHandler(BaseHandler):
             rooms = set(e.room_id for e in allowed_events)
             for room_id in rooms:
                 state = yield self.state_handler.get_current_state(room_id)
-                state_results[room_id] = state.values()
+                state_results[room_id] = list(state.values())
 
             state_results.values()
 

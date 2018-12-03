@@ -23,9 +23,9 @@ If a user leaves (or gets kicked out of) a group, either side can still use
 their attestation to "prove" their membership, until the attestation expires.
 Therefore attestations shouldn't be relied on to prove membership in important
 cases, but can for less important situtations, e.g. showing a users membership
-of groups on their profile, showing flairs, etc.abs
+of groups on their profile, showing flairs, etc.
 
-An attestsation is a signed blob of json that looks like:
+An attestation is a signed blob of json that looks like:
 
     {
         "user_id": "@foo:a.example.com",
@@ -38,14 +38,14 @@ An attestsation is a signed blob of json that looks like:
 import logging
 import random
 
+from signedjson.sign import sign_json
+
 from twisted.internet import defer
 
 from synapse.api.errors import SynapseError
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.types import get_domain_from_id
-from synapse.util.logcontext import preserve_fn
-
-from signedjson.sign import sign_json
-
+from synapse.util.logcontext import run_in_background
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ class GroupAttestionRenewer(object):
         self.attestations = hs.get_groups_attestation_signing()
 
         self._renew_attestations_loop = self.clock.looping_call(
-            self._renew_attestations, 30 * 60 * 1000,
+            self._start_renew_attestations, 30 * 60 * 1000,
         )
 
     @defer.inlineCallbacks
@@ -152,6 +152,9 @@ class GroupAttestionRenewer(object):
 
         defer.returnValue({})
 
+    def _start_renew_attestations(self):
+        return run_as_background_process("renew_attestations", self._renew_attestations)
+
     @defer.inlineCallbacks
     def _renew_attestations(self):
         """Called periodically to check if we need to update any of our attestations
@@ -165,31 +168,35 @@ class GroupAttestionRenewer(object):
 
         @defer.inlineCallbacks
         def _renew_attestation(group_id, user_id):
-            if not self.is_mine_id(group_id):
-                destination = get_domain_from_id(group_id)
-            elif not self.is_mine_id(user_id):
-                destination = get_domain_from_id(user_id)
-            else:
-                logger.warn(
-                    "Incorrectly trying to do attestations for user: %r in %r",
-                    user_id, group_id,
+            try:
+                if not self.is_mine_id(group_id):
+                    destination = get_domain_from_id(group_id)
+                elif not self.is_mine_id(user_id):
+                    destination = get_domain_from_id(user_id)
+                else:
+                    logger.warn(
+                        "Incorrectly trying to do attestations for user: %r in %r",
+                        user_id, group_id,
+                    )
+                    yield self.store.remove_attestation_renewal(group_id, user_id)
+                    return
+
+                attestation = self.attestations.create_attestation(group_id, user_id)
+
+                yield self.transport_client.renew_group_attestation(
+                    destination, group_id, user_id,
+                    content={"attestation": attestation},
                 )
-                yield self.store.remove_attestation_renewal(group_id, user_id)
-                return
 
-            attestation = self.attestations.create_attestation(group_id, user_id)
-
-            yield self.transport_client.renew_group_attestation(
-                destination, group_id, user_id,
-                content={"attestation": attestation},
-            )
-
-            yield self.store.update_attestation_renewal(
-                group_id, user_id, attestation
-            )
+                yield self.store.update_attestation_renewal(
+                    group_id, user_id, attestation
+                )
+            except Exception:
+                logger.exception("Error renewing attestation of %r in %r",
+                                 user_id, group_id)
 
         for row in rows:
             group_id = row["group_id"]
             user_id = row["user_id"]
 
-            preserve_fn(_renew_attestation)(group_id, user_id)
+            run_in_background(_renew_attestation, group_id, user_id)

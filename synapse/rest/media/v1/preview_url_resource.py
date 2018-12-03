@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import cgi
 import datetime
 import errno
@@ -23,28 +24,32 @@ import re
 import shutil
 import sys
 import traceback
-import simplejson as json
-import urlparse
 
-from twisted.web.server import NOT_DONE_YET
+import six
+from six import string_types
+from six.moves import urllib_parse as urlparse
+
+from canonicaljson import json
+
 from twisted.internet import defer
 from twisted.web.resource import Resource
+from twisted.web.server import NOT_DONE_YET
 
-from ._base import FileInfo
-
-from synapse.api.errors import (
-    SynapseError, Codes,
-)
-from synapse.util.logcontext import preserve_fn, make_deferred_yieldable
-from synapse.util.stringutils import random_string
-from synapse.util.caches.expiringcache import ExpiringCache
+from synapse.api.errors import Codes, SynapseError
 from synapse.http.client import SpiderHttpClient
 from synapse.http.server import (
-    request_handler, respond_with_json_bytes,
     respond_with_json,
+    respond_with_json_bytes,
+    wrap_json_request_handler,
 )
-from synapse.util.async import ObservableDeferred
-from synapse.util.stringutils import is_ascii
+from synapse.http.servlet import parse_integer, parse_string
+from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.util.async_helpers import ObservableDeferred
+from synapse.util.caches.expiringcache import ExpiringCache
+from synapse.util.logcontext import make_deferred_yieldable, run_in_background
+from synapse.util.stringutils import is_ascii, random_string
+
+from ._base import FileInfo
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +62,6 @@ class PreviewUrlResource(Resource):
 
         self.auth = hs.get_auth()
         self.clock = hs.get_clock()
-        self.version_string = hs.version_string
         self.filepaths = media_repo.filepaths
         self.max_spider_size = hs.config.max_spider_size
         self.server_name = hs.hostname
@@ -77,10 +81,9 @@ class PreviewUrlResource(Resource):
             # don't spider URLs more often than once an hour
             expiry_ms=60 * 60 * 1000,
         )
-        self._cache.start()
 
         self._cleaner_loop = self.clock.looping_call(
-            self._expire_url_cache_data, 10 * 1000
+            self._start_expire_url_cache_data, 10 * 1000,
         )
 
     def render_OPTIONS(self, request):
@@ -90,15 +93,15 @@ class PreviewUrlResource(Resource):
         self._async_render_GET(request)
         return NOT_DONE_YET
 
-    @request_handler()
+    @wrap_json_request_handler
     @defer.inlineCallbacks
     def _async_render_GET(self, request):
 
         # XXX: if get_user_by_req fails, what should we do in an async render?
         requester = yield self.auth.get_user_by_req(request)
-        url = request.args.get("url")[0]
-        if "ts" in request.args:
-            ts = int(request.args.get("ts")[0])
+        url = parse_string(request, "url")
+        if b"ts" in request.args:
+            ts = parse_integer(request, "ts")
         else:
             ts = self.clock.time_msec()
 
@@ -144,7 +147,8 @@ class PreviewUrlResource(Resource):
         observable = self._cache.get(url)
 
         if not observable:
-            download = preserve_fn(self._do_preview)(
+            download = run_in_background(
+                self._do_preview,
                 url, requester.user, ts,
             )
             observable = ObservableDeferred(
@@ -178,7 +182,12 @@ class PreviewUrlResource(Resource):
             cache_result["expires_ts"] > ts and
             cache_result["response_code"] / 100 == 2
         ):
-            defer.returnValue(cache_result["og"])
+            # It may be stored as text in the database, not as bytes (such as
+            # PostgreSQL). If so, encode it back before handing it on.
+            og = cache_result["og"]
+            if isinstance(og, six.text_type):
+                og = og.encode('utf8')
+            defer.returnValue(og)
             return
 
         media_info = yield self._download_url(url, user)
@@ -211,14 +220,17 @@ class PreviewUrlResource(Resource):
         elif _is_html(media_info['media_type']):
             # TODO: somehow stop a big HTML tree from exploding synapse's RAM
 
-            file = open(media_info['filename'])
-            body = file.read()
-            file.close()
+            with open(media_info['filename'], 'rb') as file:
+                body = file.read()
 
             # clobber the encoding from the content-type, or default to utf-8
             # XXX: this overrides any <meta/> or XML charset headers in the body
             # which may pose problems, but so far seems to work okay.
-            match = re.match(r'.*; *charset=(.*?)(;|$)', media_info['media_type'], re.I)
+            match = re.match(
+                r'.*; *charset="?(.*?)"?(;|$)',
+                media_info['media_type'],
+                re.I
+            )
             encoding = match.group(1) if match else "utf-8"
 
             og = decode_and_calc_og(body, media_info['uri'], encoding)
@@ -258,7 +270,7 @@ class PreviewUrlResource(Resource):
 
         logger.debug("Calculated OG for %s as %s" % (url, og))
 
-        jsonog = json.dumps(og)
+        jsonog = json.dumps(og).encode('utf8')
 
         # store OG in history-aware DB cache
         yield self.store.store_url_cache(
@@ -298,20 +310,20 @@ class PreviewUrlResource(Resource):
                 logger.warn("Error downloading %s: %r", url, e)
                 raise SynapseError(
                     500, "Failed to download content: %s" % (
-                        traceback.format_exception_only(sys.exc_type, e),
+                        traceback.format_exception_only(sys.exc_info()[0], e),
                     ),
                     Codes.UNKNOWN,
                 )
             yield finish()
 
         try:
-            if "Content-Type" in headers:
-                media_type = headers["Content-Type"][0]
+            if b"Content-Type" in headers:
+                media_type = headers[b"Content-Type"][0].decode('ascii')
             else:
                 media_type = "application/octet-stream"
             time_now_ms = self.clock.time_msec()
 
-            content_disposition = headers.get("Content-Disposition", None)
+            content_disposition = headers.get(b"Content-Disposition", None)
             if content_disposition:
                 _, params = cgi.parse_header(content_disposition[0],)
                 download_name = None
@@ -368,6 +380,11 @@ class PreviewUrlResource(Resource):
             "expires": 60 * 60 * 1000,
             "etag": headers["ETag"][0] if "ETag" in headers else None,
         })
+
+    def _start_expire_url_cache_data(self):
+        return run_as_background_process(
+            "expire_url_cache_data", self._expire_url_cache_data,
+        )
 
     @defer.inlineCallbacks
     def _expire_url_cache_data(self):
@@ -589,10 +606,13 @@ def _iterate_over_text(tree, *tags_to_ignore):
     # to be returned.
     elements = iter([tree])
     while True:
-        el = elements.next()
-        if isinstance(el, basestring):
+        el = next(elements, None)
+        if el is None:
+            return
+
+        if isinstance(el, string_types):
             yield el
-        elif el is not None and el.tag not in tags_to_ignore:
+        elif el.tag not in tags_to_ignore:
             # el.text is the text before the first child, so we can immediately
             # return it if the text exists.
             if el.text:
@@ -664,7 +684,7 @@ def summarize_paragraphs(text_nodes, min_size=200, max_size=500):
         # This splits the paragraph into words, but keeping the
         # (preceeding) whitespace intact so we can easily concat
         # words back together.
-        for match in re.finditer("\s*\S+", description):
+        for match in re.finditer(r"\s*\S+", description):
             word = match.group()
 
             # Keep adding words while the total length is less than

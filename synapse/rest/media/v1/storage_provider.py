@@ -13,17 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from twisted.internet import defer, threads
-
-from .media_storage import FileResponder
-
-from synapse.config._base import Config
-from synapse.util.logcontext import preserve_fn
-
 import logging
 import os
 import shutil
 
+from twisted.internet import defer
+
+from synapse.config._base import Config
+from synapse.util import logcontext
+from synapse.util.logcontext import run_in_background
+
+from .media_storage import FileResponder
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,12 @@ class StorageProviderWrapper(StorageProvider):
             return self.backend.store_file(path, file_info)
         else:
             # TODO: Handle errors.
-            preserve_fn(self.backend.store_file)(path, file_info)
+            def store():
+                try:
+                    return self.backend.store_file(path, file_info)
+                except Exception:
+                    logger.exception("Error storing file")
+            run_in_background(store)
             return defer.succeed(None)
 
     def fetch(self, path, file_info):
@@ -116,7 +121,8 @@ class FileStorageProviderBackend(StorageProvider):
         if not os.path.exists(dirname):
             os.makedirs(dirname)
 
-        return threads.deferToThread(
+        return logcontext.defer_to_thread(
+            self.hs.get_reactor(),
             shutil.copyfile, primary_fname, backup_fname,
         )
 

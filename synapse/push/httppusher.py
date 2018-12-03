@@ -15,27 +15,26 @@
 # limitations under the License.
 import logging
 
-from twisted.internet import defer, reactor
+import six
+
+from prometheus_client import Counter
+
+from twisted.internet import defer
 from twisted.internet.error import AlreadyCalled, AlreadyCancelled
 
-import push_rule_evaluator
-import push_tools
-import synapse
+from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.push import PusherConfigException
-from synapse.util.logcontext import LoggingContext
-from synapse.util.metrics import Measure
+
+from . import push_rule_evaluator, push_tools
+
+if six.PY3:
+    long = int
 
 logger = logging.getLogger(__name__)
 
-metrics = synapse.metrics.get_metrics_for(__name__)
+http_push_processed_counter = Counter("synapse_http_httppusher_http_pushes_processed", "")
 
-http_push_processed_counter = metrics.register_counter(
-    "http_pushes_processed",
-)
-
-http_push_failed_counter = metrics.register_counter(
-    "http_pushes_failed",
-)
+http_push_failed_counter = Counter("synapse_http_httppusher_http_pushes_failed", "")
 
 
 class HttpPusher(object):
@@ -61,7 +60,7 @@ class HttpPusher(object):
         self.backoff_delay = HttpPusher.INITIAL_BACKOFF_SEC
         self.failing_since = pusherdict['failing_since']
         self.timed_call = None
-        self.processing = False
+        self._is_processing = False
 
         # This is the highest stream ordering we know it's safe to process.
         # When new events arrive, we'll be given a window of new events: we
@@ -92,31 +91,27 @@ class HttpPusher(object):
         self.data_minus_url.update(self.data)
         del self.data_minus_url['url']
 
-    @defer.inlineCallbacks
     def on_started(self):
-        yield self._process()
+        self._start_processing()
 
-    @defer.inlineCallbacks
     def on_new_notifications(self, min_stream_ordering, max_stream_ordering):
-        self.max_stream_ordering = max(max_stream_ordering, self.max_stream_ordering)
-        yield self._process()
+        self.max_stream_ordering = max(max_stream_ordering, self.max_stream_ordering or 0)
+        self._start_processing()
 
-    @defer.inlineCallbacks
     def on_new_receipts(self, min_stream_id, max_stream_id):
         # Note that the min here shouldn't be relied upon to be accurate.
 
         # We could check the receipts are actually m.read receipts here,
         # but currently that's the only type of receipt anyway...
-        with LoggingContext("push.on_new_receipts"):
-            with Measure(self.clock, "push.on_new_receipts"):
-                badge = yield push_tools.get_badge_count(
-                    self.hs.get_datastore(), self.user_id
-                )
-            yield self._send_badge(badge)
+        run_as_background_process("http_pusher.on_new_receipts", self._update_badge)
 
     @defer.inlineCallbacks
+    def _update_badge(self):
+        badge = yield push_tools.get_badge_count(self.hs.get_datastore(), self.user_id)
+        yield self._send_badge(badge)
+
     def on_timer(self):
-        yield self._process()
+        self._start_processing()
 
     def on_stop(self):
         if self.timed_call:
@@ -126,27 +121,31 @@ class HttpPusher(object):
                 pass
             self.timed_call = None
 
-    @defer.inlineCallbacks
-    def _process(self):
-        if self.processing:
+    def _start_processing(self):
+        if self._is_processing:
             return
 
-        with LoggingContext("push._process"):
-            with Measure(self.clock, "push._process"):
+        run_as_background_process("httppush.process", self._process)
+
+    @defer.inlineCallbacks
+    def _process(self):
+        # we should never get here if we are already processing
+        assert not self._is_processing
+
+        try:
+            self._is_processing = True
+            # if the max ordering changes while we're running _unsafe_process,
+            # call it again, and so on until we've caught up.
+            while True:
+                starting_max_ordering = self.max_stream_ordering
                 try:
-                    self.processing = True
-                    # if the max ordering changes while we're running _unsafe_process,
-                    # call it again, and so on until we've caught up.
-                    while True:
-                        starting_max_ordering = self.max_stream_ordering
-                        try:
-                            yield self._unsafe_process()
-                        except Exception:
-                            logger.exception("Exception processing notifs")
-                        if self.max_stream_ordering == starting_max_ordering:
-                            break
-                finally:
-                    self.processing = False
+                    yield self._unsafe_process()
+                except Exception:
+                    logger.exception("Exception processing notifs")
+                if self.max_stream_ordering == starting_max_ordering:
+                    break
+        finally:
+            self._is_processing = False
 
     @defer.inlineCallbacks
     def _unsafe_process(self):
@@ -222,7 +221,9 @@ class HttpPusher(object):
                     )
                 else:
                     logger.info("Push failed: delaying for %ds", self.backoff_delay)
-                    self.timed_call = reactor.callLater(self.backoff_delay, self.on_timer)
+                    self.timed_call = self.hs.get_reactor().callLater(
+                        self.backoff_delay, self.on_timer
+                    )
                     self.backoff_delay = min(self.backoff_delay * 2, self.MAX_BACKOFF_SEC)
                     break
 
@@ -310,10 +311,10 @@ class HttpPusher(object):
                 ]
             }
         }
-        if event.type == 'm.room.member':
+        if event.type == 'm.room.member' and event.is_state():
             d['notification']['membership'] = event.content['membership']
             d['notification']['user_is_target'] = event.state_key == self.user_id
-        if self.hs.config.push_include_content and 'content' in event:
+        if self.hs.config.push_include_content and event.content:
             d['notification']['content'] = event.content
 
         # We no longer send aliases separately, instead, we send the human

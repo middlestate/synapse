@@ -16,6 +16,9 @@
 import logging
 import sys
 
+from twisted.internet import defer, reactor
+from twisted.web.resource import NoResource
+
 import synapse
 from synapse import events
 from synapse.app import _base
@@ -25,6 +28,7 @@ from synapse.config.logger import setup_logging
 from synapse.crypto import context_factory
 from synapse.federation import send_queue
 from synapse.http.site import SynapseSite
+from synapse.metrics import RegistryProxy
 from synapse.metrics.resource import METRICS_PREFIX, MetricsResource
 from synapse.replication.slave.storage.deviceinbox import SlavedDeviceInboxStore
 from synapse.replication.slave.storage.devices import SlavedDeviceStore
@@ -32,23 +36,21 @@ from synapse.replication.slave.storage.events import SlavedEventStore
 from synapse.replication.slave.storage.presence import SlavedPresenceStore
 from synapse.replication.slave.storage.receipts import SlavedReceiptsStore
 from synapse.replication.slave.storage.registration import SlavedRegistrationStore
-from synapse.replication.slave.storage.transactions import TransactionStore
+from synapse.replication.slave.storage.transactions import SlavedTransactionStore
 from synapse.replication.tcp.client import ReplicationClientHandler
 from synapse.server import HomeServer
 from synapse.storage.engines import create_engine
-from synapse.util.async import Linearizer
+from synapse.util.async_helpers import Linearizer
 from synapse.util.httpresourcetree import create_resource_tree
-from synapse.util.logcontext import LoggingContext, preserve_fn
+from synapse.util.logcontext import LoggingContext, run_in_background
 from synapse.util.manhole import manhole
 from synapse.util.versionstring import get_version_string
-from twisted.internet import defer, reactor
-from twisted.web.resource import NoResource
 
 logger = logging.getLogger("synapse.app.federation_sender")
 
 
 class FederationSenderSlaveStore(
-    SlavedDeviceInboxStore, TransactionStore, SlavedReceiptsStore, SlavedEventStore,
+    SlavedDeviceInboxStore, SlavedTransactionStore, SlavedReceiptsStore, SlavedEventStore,
     SlavedRegistrationStore, SlavedDeviceStore, SlavedPresenceStore,
 ):
     def __init__(self, db_conn, hs):
@@ -76,10 +78,7 @@ class FederationSenderSlaveStore(
 
 
 class FederationSenderServer(HomeServer):
-    def setup(self):
-        logger.info("Setting up.")
-        self.datastore = FederationSenderSlaveStore(self.get_db_conn(), self)
-        logger.info("Finished setting up.")
+    DATASTORE_CLASS = FederationSenderSlaveStore
 
     def _listen_http(self, listener_config):
         port = listener_config["port"]
@@ -89,7 +88,7 @@ class FederationSenderServer(HomeServer):
         for res in listener_config["resources"]:
             for name in res["names"]:
                 if name == "metrics":
-                    resources[METRICS_PREFIX] = MetricsResource(self)
+                    resources[METRICS_PREFIX] = MetricsResource(RegistryProxy)
 
         root_resource = create_resource_tree(resources, NoResource())
 
@@ -101,6 +100,7 @@ class FederationSenderServer(HomeServer):
                 site_tag,
                 listener_config,
                 root_resource,
+                self.version_string,
             )
         )
 
@@ -120,6 +120,13 @@ class FederationSenderServer(HomeServer):
                         globals={"hs": self},
                     )
                 )
+            elif listener["type"] == "metrics":
+                if not self.get_config().enable_metrics:
+                    logger.warn(("Metrics listener configured, but "
+                                 "enable_metrics is not True!"))
+                else:
+                    _base.listen_metrics(listener["bind_addresses"],
+                                         listener["port"])
             else:
                 logger.warn("Unrecognized listener type: %s", listener["type"])
 
@@ -134,8 +141,9 @@ class FederationSenderReplicationHandler(ReplicationClientHandler):
         super(FederationSenderReplicationHandler, self).__init__(hs.get_datastore())
         self.send_handler = FederationSenderHandler(hs, self)
 
+    @defer.inlineCallbacks
     def on_rdata(self, stream_name, token, rows):
-        super(FederationSenderReplicationHandler, self).on_rdata(
+        yield super(FederationSenderReplicationHandler, self).on_rdata(
             stream_name, token, rows
         )
         self.send_handler.process_replication_rows(stream_name, token, rows)
@@ -152,7 +160,7 @@ def start(config_options):
             "Synapse federation sender", config_options
         )
     except ConfigError as e:
-        sys.stderr.write("\n" + e.message + "\n")
+        sys.stderr.write("\n" + str(e) + "\n")
         sys.exit(1)
 
     assert config.worker_app == "synapse.app.federation_sender"
@@ -176,11 +184,13 @@ def start(config_options):
     config.send_federation = True
 
     tls_server_context_factory = context_factory.ServerContextFactory(config)
+    tls_client_options_factory = context_factory.ClientTLSOptionsFactory(config)
 
     ps = FederationSenderServer(
         config.server_name,
         db_config=config.database_config,
         tls_server_context_factory=tls_server_context_factory,
+        tls_client_options_factory=tls_client_options_factory,
         config=config,
         version_string="Synapse/" + get_version_string(synapse),
         database_engine=database_engine,
@@ -191,7 +201,6 @@ def start(config_options):
 
     def start():
         ps.get_datastore().start_profiling()
-        ps.get_state_handler().start_caching()
 
     reactor.callWhenRunning(start)
     _base.start_worker_reactor("synapse-federation-sender", config)
@@ -229,7 +238,7 @@ class FederationSenderHandler(object):
         # presence, typing, etc.
         if stream_name == "federation":
             send_queue.process_rows_for_federation(self.federation_sender, rows)
-            preserve_fn(self.update_token)(token)
+            run_in_background(self.update_token, token)
 
         # We also need to poke the federation sender when new events happen
         elif stream_name == "events":
@@ -237,19 +246,22 @@ class FederationSenderHandler(object):
 
     @defer.inlineCallbacks
     def update_token(self, token):
-        self.federation_position = token
+        try:
+            self.federation_position = token
 
-        # We linearize here to ensure we don't have races updating the token
-        with (yield self._fed_position_linearizer.queue(None)):
-            if self._last_ack < self.federation_position:
-                yield self.store.update_federation_out_pos(
-                    "federation", self.federation_position
-                )
+            # We linearize here to ensure we don't have races updating the token
+            with (yield self._fed_position_linearizer.queue(None)):
+                if self._last_ack < self.federation_position:
+                    yield self.store.update_federation_out_pos(
+                        "federation", self.federation_position
+                    )
 
-                # We ACK this token over replication so that the master can drop
-                # its in memory queues
-                self.replication_client.send_federation_ack(self.federation_position)
-                self._last_ack = self.federation_position
+                    # We ACK this token over replication so that the master can drop
+                    # its in memory queues
+                    self.replication_client.send_federation_ack(self.federation_position)
+                    self._last_ack = self.federation_position
+        except Exception:
+            logger.exception("Error updating federation stream position")
 
 
 if __name__ == '__main__':

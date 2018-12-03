@@ -17,20 +17,21 @@
 import abc
 import logging
 
+from six.moves import http_client
+
 from signedjson.key import decode_verify_key_bytes
 from signedjson.sign import verify_signed_json
-from twisted.internet import defer
 from unpaddedbase64 import decode_base64
 
-import synapse.types
-from synapse.api.constants import (
-    EventTypes, Membership,
-)
-from synapse.api.errors import AuthError, SynapseError, Codes
-from synapse.types import UserID, RoomID
-from synapse.util.async import Linearizer
-from synapse.util.distributor import user_left_room, user_joined_room
+from twisted.internet import defer
 
+import synapse.server
+import synapse.types
+from synapse.api.constants import EventTypes, Membership
+from synapse.api.errors import AuthError, Codes, SynapseError
+from synapse.types import RoomID, UserID
+from synapse.util.async_helpers import Linearizer
+from synapse.util.distributor import user_joined_room, user_left_room
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,11 @@ class RoomMemberHandler(object):
     __metaclass__ = abc.ABCMeta
 
     def __init__(self, hs):
+        """
+
+        Args:
+            hs (synapse.server.HomeServer):
+        """
         self.hs = hs
         self.store = hs.get_datastore()
         self.auth = hs.get_auth()
@@ -63,6 +69,7 @@ class RoomMemberHandler(object):
 
         self.clock = hs.get_clock()
         self.spam_checker = hs.get_spam_checker()
+        self._server_notices_mxid = self.config.server_notices_mxid
 
     @abc.abstractmethod
     def _remote_join(self, requester, remote_room_hosts, room_id, user, content):
@@ -194,7 +201,9 @@ class RoomMemberHandler(object):
             ratelimit=ratelimit,
         )
 
-        prev_member_event_id = context.prev_state_ids.get(
+        prev_state_ids = yield context.get_prev_state_ids(self.store)
+
+        prev_member_event_id = prev_state_ids.get(
             (EventTypes.Member, target.to_string()),
             None
         )
@@ -290,11 +299,26 @@ class RoomMemberHandler(object):
             if is_blocked:
                 raise SynapseError(403, "This room has been blocked on this server")
 
-        if effective_membership_state == "invite":
+        if effective_membership_state == Membership.INVITE:
+            # block any attempts to invite the server notices mxid
+            if target.to_string() == self._server_notices_mxid:
+                raise SynapseError(
+                    http_client.FORBIDDEN,
+                    "Cannot invite this user",
+                )
+
             block_invite = False
-            is_requester_admin = yield self.auth.is_server_admin(
-                requester.user,
-            )
+
+            if (self._server_notices_mxid is not None and
+                    requester.user.to_string() == self._server_notices_mxid):
+                # allow the server notices mxid to send invites
+                is_requester_admin = True
+
+            else:
+                is_requester_admin = yield self.auth.is_server_admin(
+                    requester.user,
+                )
+
             if not is_requester_admin:
                 if self.config.block_non_admin_invites:
                     logger.info(
@@ -320,6 +344,7 @@ class RoomMemberHandler(object):
         latest_event_ids = (
             event_id for (event_id, _, _) in prev_events_and_hashes
         )
+
         current_state_ids = yield self.state_handler.get_current_state_ids(
             room_id, latest_event_ids=latest_event_ids,
         )
@@ -348,6 +373,20 @@ class RoomMemberHandler(object):
                 same_sender = requester.user.to_string() == old_state.sender
                 if same_sender and same_membership and same_content:
                     defer.returnValue(old_state)
+
+            # we don't allow people to reject invites to the server notice
+            # room, but they can leave it once they are joined.
+            if (
+                old_membership == Membership.INVITE and
+                effective_membership_state == Membership.LEAVE
+            ):
+                is_blocked = yield self._is_server_notice_room(room_id)
+                if is_blocked:
+                    raise SynapseError(
+                        http_client.FORBIDDEN,
+                        "You cannot reject this invite",
+                        errcode=Codes.CANNOT_LEAVE_SERVER_NOTICE_ROOM,
+                    )
 
         is_host_in_room = yield self._is_host_in_room(current_state_ids)
 
@@ -460,9 +499,10 @@ class RoomMemberHandler(object):
         if prev_event is not None:
             return
 
+        prev_state_ids = yield context.get_prev_state_ids(self.store)
         if event.membership == Membership.JOIN:
             if requester.is_guest:
-                guest_can_join = yield self._can_guest_join(context.prev_state_ids)
+                guest_can_join = yield self._can_guest_join(prev_state_ids)
                 if not guest_can_join:
                     # This should be an auth check, but guests are a local concept,
                     # so don't really fit into the general auth process.
@@ -481,7 +521,7 @@ class RoomMemberHandler(object):
             ratelimit=ratelimit,
         )
 
-        prev_member_event_id = context.prev_state_ids.get(
+        prev_member_event_id = prev_state_ids.get(
             (EventTypes.Member, event.state_key),
             None
         )
@@ -542,6 +582,11 @@ class RoomMemberHandler(object):
 
         room_id = mapping["room_id"]
         servers = mapping["servers"]
+
+        # put the server which owns the alias at the front of the server list.
+        if room_alias.domain in servers:
+            servers.remove(room_alias.domain)
+        servers.insert(0, room_alias.domain)
 
         defer.returnValue((RoomID.from_string(room_id), servers))
 
@@ -668,6 +713,10 @@ class RoomMemberHandler(object):
         if member_event:
             inviter_display_name = member_event.content.get("displayname", "")
             inviter_avatar_url = member_event.content.get("avatar_url", "")
+
+        # if user has no display name, default to their MXID
+        if not inviter_display_name:
+            inviter_display_name = user.to_string()
 
         canonical_room_alias = ""
         canonical_alias_event = room_state.get((EventTypes.CanonicalAlias, ""))
@@ -843,6 +892,13 @@ class RoomMemberHandler(object):
                 defer.returnValue(True)
 
         defer.returnValue(False)
+
+    @defer.inlineCallbacks
+    def _is_server_notice_room(self, room_id):
+        if self._server_notices_mxid is None:
+            defer.returnValue(False)
+        user_ids = yield self.store.get_users_in_room(room_id)
+        defer.returnValue(self._server_notices_mxid in user_ids)
 
 
 class RoomMemberMasterHandler(RoomMemberHandler):

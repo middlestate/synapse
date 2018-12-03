@@ -14,17 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import simplejson as json
 import logging
 
-from canonicaljson import encode_canonical_json
+from six import iteritems
+
+from canonicaljson import encode_canonical_json, json
+
 from twisted.internet import defer
 
-from synapse.api.errors import (
-    SynapseError, CodeMessageException, FederationDeniedError,
-)
-from synapse.types import get_domain_from_id, UserID
-from synapse.util.logcontext import preserve_fn, make_deferred_yieldable
+from synapse.api.errors import CodeMessageException, FederationDeniedError, SynapseError
+from synapse.types import UserID, get_domain_from_id
+from synapse.util.logcontext import make_deferred_yieldable, run_in_background
 from synapse.util.retryutils import NotRetryingDestination
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ class E2eKeysHandler(object):
             else:
                 remote_queries[user_id] = device_ids
 
-        # Firt get local devices.
+        # First get local devices.
         failures = {}
         results = {}
         if local_query:
@@ -92,7 +92,7 @@ class E2eKeysHandler(object):
         remote_queries_not_in_cache = {}
         if remote_queries:
             query_list = []
-            for user_id, device_ids in remote_queries.iteritems():
+            for user_id, device_ids in iteritems(remote_queries):
                 if device_ids:
                     query_list.extend((user_id, device_id) for device_id in device_ids)
                 else:
@@ -103,9 +103,9 @@ class E2eKeysHandler(object):
                     query_list
                 )
             )
-            for user_id, devices in remote_results.iteritems():
+            for user_id, devices in iteritems(remote_results):
                 user_devices = results.setdefault(user_id, {})
-                for device_id, device in devices.iteritems():
+                for device_id, device in iteritems(devices):
                     keys = device.get("keys", None)
                     device_display_name = device.get("device_display_name", None)
                     if keys:
@@ -139,9 +139,9 @@ class E2eKeysHandler(object):
                 failures[destination] = _exception_to_failure(e)
 
         yield make_deferred_yieldable(defer.gatherResults([
-            preserve_fn(do_remote_query)(destination)
+            run_in_background(do_remote_query, destination)
             for destination in remote_queries_not_in_cache
-        ]))
+        ], consumeErrors=True))
 
         defer.returnValue({
             "device_keys": results, "failures": failures,
@@ -242,17 +242,17 @@ class E2eKeysHandler(object):
                 failures[destination] = _exception_to_failure(e)
 
         yield make_deferred_yieldable(defer.gatherResults([
-            preserve_fn(claim_client_keys)(destination)
+            run_in_background(claim_client_keys, destination)
             for destination in remote_queries
-        ]))
+        ], consumeErrors=True))
 
         logger.info(
             "Claimed one-time-keys: %s",
             ",".join((
                 "%s for %s:%s" % (key_id, user_id, device_id)
-                for user_id, user_keys in json_result.iteritems()
-                for device_id, device_keys in user_keys.iteritems()
-                for key_id, _ in device_keys.iteritems()
+                for user_id, user_keys in iteritems(json_result)
+                for device_id, device_keys in iteritems(user_keys)
+                for key_id, _ in iteritems(device_keys)
             )),
         )
 
@@ -330,7 +330,8 @@ class E2eKeysHandler(object):
                         (algorithm, key_id, ex_json, key)
                     )
             else:
-                new_keys.append((algorithm, key_id, encode_canonical_json(key)))
+                new_keys.append((
+                    algorithm, key_id, encode_canonical_json(key).decode('ascii')))
 
         yield self.store.add_e2e_one_time_keys(
             user_id, device_id, time_now, new_keys
@@ -340,7 +341,7 @@ class E2eKeysHandler(object):
 def _exception_to_failure(e):
     if isinstance(e, CodeMessageException):
         return {
-            "status": e.code, "message": e.message,
+            "status": e.code, "message": str(e),
         }
 
     if isinstance(e, NotRetryingDestination):
@@ -356,9 +357,9 @@ def _exception_to_failure(e):
     # include ConnectionRefused and other errors
     #
     # Note that some Exceptions (notably twisted's ResponseFailed etc) don't
-    # give a string for e.message, which simplejson then fails to serialize.
+    # give a string for e.message, which json then fails to serialize.
     return {
-        "status": 503, "message": str(e.message),
+        "status": 503, "message": str(e),
     }
 
 

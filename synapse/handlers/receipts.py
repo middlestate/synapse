@@ -12,17 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from synapse.util import logcontext
-
-from ._base import BaseHandler
+import logging
 
 from twisted.internet import defer
 
-from synapse.util.logcontext import PreserveLoggingContext
 from synapse.types import get_domain_from_id
+from synapse.util import logcontext
 
-import logging
-
+from ._base import BaseHandler
 
 logger = logging.getLogger(__name__)
 
@@ -118,16 +115,15 @@ class ReceiptsHandler(BaseHandler):
 
         affected_room_ids = list(set([r["room_id"] for r in receipts]))
 
-        with PreserveLoggingContext():
-            self.notifier.on_new_event(
-                "receipt_key", max_batch_id, rooms=affected_room_ids
-            )
-            # Note that the min here shouldn't be relied upon to be accurate.
-            self.hs.get_pusherpool().on_new_receipts(
-                min_batch_id, max_batch_id, affected_room_ids
-            )
+        self.notifier.on_new_event(
+            "receipt_key", max_batch_id, rooms=affected_room_ids
+        )
+        # Note that the min here shouldn't be relied upon to be accurate.
+        yield self.hs.get_pusherpool().on_new_receipts(
+            min_batch_id, max_batch_id, affected_room_ids,
+        )
 
-            defer.returnValue(True)
+        defer.returnValue(True)
 
     @logcontext.preserve_fn   # caller should not yield on this
     @defer.inlineCallbacks
@@ -135,37 +131,40 @@ class ReceiptsHandler(BaseHandler):
         """Given a list of receipts, works out which remote servers should be
         poked and pokes them.
         """
-        # TODO: Some of this stuff should be coallesced.
-        for receipt in receipts:
-            room_id = receipt["room_id"]
-            receipt_type = receipt["receipt_type"]
-            user_id = receipt["user_id"]
-            event_ids = receipt["event_ids"]
-            data = receipt["data"]
+        try:
+            # TODO: Some of this stuff should be coallesced.
+            for receipt in receipts:
+                room_id = receipt["room_id"]
+                receipt_type = receipt["receipt_type"]
+                user_id = receipt["user_id"]
+                event_ids = receipt["event_ids"]
+                data = receipt["data"]
 
-            users = yield self.state.get_current_user_in_room(room_id)
-            remotedomains = set(get_domain_from_id(u) for u in users)
-            remotedomains = remotedomains.copy()
-            remotedomains.discard(self.server_name)
+                users = yield self.state.get_current_user_in_room(room_id)
+                remotedomains = set(get_domain_from_id(u) for u in users)
+                remotedomains = remotedomains.copy()
+                remotedomains.discard(self.server_name)
 
-            logger.debug("Sending receipt to: %r", remotedomains)
+                logger.debug("Sending receipt to: %r", remotedomains)
 
-            for domain in remotedomains:
-                self.federation.send_edu(
-                    destination=domain,
-                    edu_type="m.receipt",
-                    content={
-                        room_id: {
-                            receipt_type: {
-                                user_id: {
-                                    "event_ids": event_ids,
-                                    "data": data,
+                for domain in remotedomains:
+                    self.federation.send_edu(
+                        destination=domain,
+                        edu_type="m.receipt",
+                        content={
+                            room_id: {
+                                receipt_type: {
+                                    user_id: {
+                                        "event_ids": event_ids,
+                                        "data": data,
+                                    }
                                 }
-                            }
+                            },
                         },
-                    },
-                    key=(room_id, receipt_type, user_id),
-                )
+                        key=(room_id, receipt_type, user_id),
+                    )
+        except Exception:
+            logger.exception("Error pushing receipts to remote servers")
 
     @defer.inlineCallbacks
     def get_receipts_for_room(self, room_id, to_key):

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright 2014-2016 OpenMarket Ltd
-# Copyright 2017 New Vector Ltd.
+# Copyright 2017, 2018 New Vector Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,32 +14,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from synapse.crypto.keyclient import fetch_server_key
-from synapse.api.errors import SynapseError, Codes
-from synapse.util import unwrapFirstError, logcontext
-from synapse.util.logcontext import (
-    PreserveLoggingContext,
-    preserve_fn
-)
-from synapse.util.metrics import Measure
+import hashlib
+import logging
+from collections import namedtuple
 
-from twisted.internet import defer
-
-from signedjson.sign import (
-    verify_signed_json, signature_ids, sign_json, encode_canonical_json
-)
 from signedjson.key import (
-    is_signing_algorithm_supported, decode_verify_key_bytes
+    decode_verify_key_bytes,
+    encode_verify_key_base64,
+    is_signing_algorithm_supported,
+)
+from signedjson.sign import (
+    SignatureVerifyException,
+    encode_canonical_json,
+    sign_json,
+    signature_ids,
+    verify_signed_json,
 )
 from unpaddedbase64 import decode_base64, encode_base64
 
 from OpenSSL import crypto
+from twisted.internet import defer
 
-from collections import namedtuple
-import urllib
-import hashlib
-import logging
-
+from synapse.api.errors import Codes, SynapseError
+from synapse.crypto.keyclient import fetch_server_key
+from synapse.util import logcontext, unwrapFirstError
+from synapse.util.logcontext import (
+    LoggingContext,
+    PreserveLoggingContext,
+    preserve_fn,
+    run_in_background,
+)
+from synapse.util.metrics import Measure
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +60,7 @@ Attributes:
     key_ids(set(str)): The set of key_ids to that could be used to verify the
         JSON object
     json_object(dict): The JSON object to verify.
-    deferred(twisted.internet.defer.Deferred):
+    deferred(Deferred[str, str, nacl.signing.VerifyKey]):
         A deferred (server_name, key_id, verify_key) tuple that resolves when
         a verify key has been fetched. The deferreds' callbacks are run with no
         logcontext.
@@ -127,7 +132,7 @@ class Keyring(object):
 
             verify_requests.append(verify_request)
 
-        preserve_fn(self._start_key_lookups)(verify_requests)
+        run_in_background(self._start_key_lookups, verify_requests)
 
         # Pass those keys to handle_key_deferred so that the json object
         # signatures can be verified
@@ -146,52 +151,55 @@ class Keyring(object):
             verify_requests (List[VerifyKeyRequest]):
         """
 
-        # create a deferred for each server we're going to look up the keys
-        # for; we'll resolve them once we have completed our lookups.
-        # These will be passed into wait_for_previous_lookups to block
-        # any other lookups until we have finished.
-        # The deferreds are called with no logcontext.
-        server_to_deferred = {
-            rq.server_name: defer.Deferred()
-            for rq in verify_requests
-        }
+        try:
+            # create a deferred for each server we're going to look up the keys
+            # for; we'll resolve them once we have completed our lookups.
+            # These will be passed into wait_for_previous_lookups to block
+            # any other lookups until we have finished.
+            # The deferreds are called with no logcontext.
+            server_to_deferred = {
+                rq.server_name: defer.Deferred()
+                for rq in verify_requests
+            }
 
-        # We want to wait for any previous lookups to complete before
-        # proceeding.
-        yield self.wait_for_previous_lookups(
-            [rq.server_name for rq in verify_requests],
-            server_to_deferred,
-        )
-
-        # Actually start fetching keys.
-        self._get_server_verify_keys(verify_requests)
-
-        # When we've finished fetching all the keys for a given server_name,
-        # resolve the deferred passed to `wait_for_previous_lookups` so that
-        # any lookups waiting will proceed.
-        #
-        # map from server name to a set of request ids
-        server_to_request_ids = {}
-
-        for verify_request in verify_requests:
-            server_name = verify_request.server_name
-            request_id = id(verify_request)
-            server_to_request_ids.setdefault(server_name, set()).add(request_id)
-
-        def remove_deferreds(res, verify_request):
-            server_name = verify_request.server_name
-            request_id = id(verify_request)
-            server_to_request_ids[server_name].discard(request_id)
-            if not server_to_request_ids[server_name]:
-                d = server_to_deferred.pop(server_name, None)
-                if d:
-                    d.callback(None)
-            return res
-
-        for verify_request in verify_requests:
-            verify_request.deferred.addBoth(
-                remove_deferreds, verify_request,
+            # We want to wait for any previous lookups to complete before
+            # proceeding.
+            yield self.wait_for_previous_lookups(
+                [rq.server_name for rq in verify_requests],
+                server_to_deferred,
             )
+
+            # Actually start fetching keys.
+            self._get_server_verify_keys(verify_requests)
+
+            # When we've finished fetching all the keys for a given server_name,
+            # resolve the deferred passed to `wait_for_previous_lookups` so that
+            # any lookups waiting will proceed.
+            #
+            # map from server name to a set of request ids
+            server_to_request_ids = {}
+
+            for verify_request in verify_requests:
+                server_name = verify_request.server_name
+                request_id = id(verify_request)
+                server_to_request_ids.setdefault(server_name, set()).add(request_id)
+
+            def remove_deferreds(res, verify_request):
+                server_name = verify_request.server_name
+                request_id = id(verify_request)
+                server_to_request_ids[server_name].discard(request_id)
+                if not server_to_request_ids[server_name]:
+                    d = server_to_deferred.pop(server_name, None)
+                    if d:
+                        d.callback(None)
+                return res
+
+            for verify_request in verify_requests:
+                verify_request.deferred.addBoth(
+                    remove_deferreds, verify_request,
+                )
+        except Exception:
+            logger.exception("Error starting key lookups")
 
     @defer.inlineCallbacks
     def wait_for_previous_lookups(self, server_names, server_to_deferred):
@@ -208,23 +216,34 @@ class Keyring(object):
             servers have completed. Follows the synapse rules of logcontext
             preservation.
         """
+        loop_count = 1
         while True:
             wait_on = [
-                self.key_downloads[server_name]
+                (server_name, self.key_downloads[server_name])
                 for server_name in server_names
                 if server_name in self.key_downloads
             ]
-            if wait_on:
-                with PreserveLoggingContext():
-                    yield defer.DeferredList(wait_on)
-            else:
+            if not wait_on:
                 break
+            logger.info(
+                "Waiting for existing lookups for %s to complete [loop %i]",
+                [w[0] for w in wait_on], loop_count,
+            )
+            with PreserveLoggingContext():
+                yield defer.DeferredList((w[1] for w in wait_on))
+
+            loop_count += 1
+
+        ctx = LoggingContext.current_context()
 
         def rm(r, server_name_):
-            self.key_downloads.pop(server_name_, None)
+            with PreserveLoggingContext(ctx):
+                logger.debug("Releasing key lookup lock on %s", server_name_)
+                self.key_downloads.pop(server_name_, None)
             return r
 
         for server_name, deferred in server_to_deferred.items():
+            logger.debug("Got key lookup lock on %s", server_name)
             self.key_downloads[server_name] = deferred
             deferred.addBoth(rm, server_name)
 
@@ -313,7 +332,7 @@ class Keyring(object):
                     if not verify_request.deferred.called:
                         verify_request.deferred.errback(err)
 
-        preserve_fn(do_iterations)().addErrback(on_err)
+        run_in_background(do_iterations).addErrback(on_err)
 
     @defer.inlineCallbacks
     def get_keys_from_store(self, server_name_and_key_ids):
@@ -329,8 +348,9 @@ class Keyring(object):
         """
         res = yield logcontext.make_deferred_yieldable(defer.gatherResults(
             [
-                preserve_fn(self.store.get_server_verify_keys)(
-                    server_name, key_ids
+                run_in_background(
+                    self.store.get_server_verify_keys,
+                    server_name, key_ids,
                 ).addCallback(lambda ks, server: (server, ks), server_name)
                 for server_name, key_ids in server_name_and_key_ids
             ],
@@ -358,7 +378,7 @@ class Keyring(object):
 
         results = yield logcontext.make_deferred_yieldable(defer.gatherResults(
             [
-                preserve_fn(get_key)(p_name, p_keys)
+                run_in_background(get_key, p_name, p_keys)
                 for p_name, p_keys in self.perspective_servers.items()
             ],
             consumeErrors=True,
@@ -373,32 +393,13 @@ class Keyring(object):
 
     @defer.inlineCallbacks
     def get_keys_from_server(self, server_name_and_key_ids):
-        @defer.inlineCallbacks
-        def get_key(server_name, key_ids):
-            keys = None
-            try:
-                keys = yield self.get_server_verify_key_v2_direct(
-                    server_name, key_ids
-                )
-            except Exception as e:
-                logger.info(
-                    "Unable to get key %r for %r directly: %s %s",
-                    key_ids, server_name,
-                    type(e).__name__, str(e),
-                )
-
-            if not keys:
-                keys = yield self.get_server_verify_key_v1_direct(
-                    server_name, key_ids
-                )
-
-                keys = {server_name: keys}
-
-            defer.returnValue(keys)
-
         results = yield logcontext.make_deferred_yieldable(defer.gatherResults(
             [
-                preserve_fn(get_key)(server_name, key_ids)
+                run_in_background(
+                    self.get_server_verify_key_v2_direct,
+                    server_name,
+                    key_ids,
+                )
                 for server_name, key_ids in server_name_and_key_ids
             ],
             consumeErrors=True,
@@ -423,7 +424,7 @@ class Keyring(object):
         # an incoming request.
         query_response = yield self.client.post_json(
             destination=perspective_name,
-            path=b"/_matrix/key/v2/query",
+            path="/_matrix/key/v2/query",
             data={
                 u"server_keys": {
                     server_name: {
@@ -481,7 +482,8 @@ class Keyring(object):
 
         yield logcontext.make_deferred_yieldable(defer.gatherResults(
             [
-                preserve_fn(self.store_keys)(
+                run_in_background(
+                    self.store_keys,
                     server_name=server_name,
                     from_server=perspective_name,
                     verify_keys=response_keys,
@@ -502,10 +504,7 @@ class Keyring(object):
                 continue
 
             (response, tls_certificate) = yield fetch_server_key(
-                server_name, self.hs.tls_server_context_factory,
-                path=(b"/_matrix/key/v2/server/%s" % (
-                    urllib.quote(requested_key_id),
-                )).encode("ascii"),
+                server_name, self.hs.tls_client_options_factory, requested_key_id
             )
 
             if (u"signatures" not in response
@@ -539,7 +538,8 @@ class Keyring(object):
 
         yield logcontext.make_deferred_yieldable(defer.gatherResults(
             [
-                preserve_fn(self.store_keys)(
+                run_in_background(
+                    self.store_keys,
                     server_name=key_server_name,
                     from_server=server_name,
                     verify_keys=verify_keys,
@@ -615,7 +615,8 @@ class Keyring(object):
 
         yield logcontext.make_deferred_yieldable(defer.gatherResults(
             [
-                preserve_fn(self.store.store_server_keys_json)(
+                run_in_background(
+                    self.store.store_server_keys_json,
                     server_name=server_name,
                     key_id=key_id,
                     from_server=server_name,
@@ -632,78 +633,6 @@ class Keyring(object):
 
         defer.returnValue(results)
 
-    @defer.inlineCallbacks
-    def get_server_verify_key_v1_direct(self, server_name, key_ids):
-        """Finds a verification key for the server with one of the key ids.
-        Args:
-            server_name (str): The name of the server to fetch a key for.
-            keys_ids (list of str): The key_ids to check for.
-        """
-
-        # Try to fetch the key from the remote server.
-
-        (response, tls_certificate) = yield fetch_server_key(
-            server_name, self.hs.tls_server_context_factory
-        )
-
-        # Check the response.
-
-        x509_certificate_bytes = crypto.dump_certificate(
-            crypto.FILETYPE_ASN1, tls_certificate
-        )
-
-        if ("signatures" not in response
-                or server_name not in response["signatures"]):
-            raise KeyLookupError("Key response not signed by remote server")
-
-        if "tls_certificate" not in response:
-            raise KeyLookupError("Key response missing TLS certificate")
-
-        tls_certificate_b64 = response["tls_certificate"]
-
-        if encode_base64(x509_certificate_bytes) != tls_certificate_b64:
-            raise KeyLookupError("TLS certificate doesn't match")
-
-        # Cache the result in the datastore.
-
-        time_now_ms = self.clock.time_msec()
-
-        verify_keys = {}
-        for key_id, key_base64 in response["verify_keys"].items():
-            if is_signing_algorithm_supported(key_id):
-                key_bytes = decode_base64(key_base64)
-                verify_key = decode_verify_key_bytes(key_id, key_bytes)
-                verify_key.time_added = time_now_ms
-                verify_keys[key_id] = verify_key
-
-        for key_id in response["signatures"][server_name]:
-            if key_id not in response["verify_keys"]:
-                raise KeyLookupError(
-                    "Key response must include verification keys for all"
-                    " signatures"
-                )
-            if key_id in verify_keys:
-                verify_signed_json(
-                    response,
-                    server_name,
-                    verify_keys[key_id]
-                )
-
-        yield self.store.store_server_certificate(
-            server_name,
-            server_name,
-            time_now_ms,
-            tls_certificate,
-        )
-
-        yield self.store_keys(
-            server_name=server_name,
-            from_server=server_name,
-            verify_keys=verify_keys,
-        )
-
-        defer.returnValue(verify_keys)
-
     def store_keys(self, server_name, from_server, verify_keys):
         """Store a collection of verify keys for a given server
         Args:
@@ -716,7 +645,8 @@ class Keyring(object):
         # TODO(markjh): Store whether the keys have expired.
         return logcontext.make_deferred_yieldable(defer.gatherResults(
             [
-                preserve_fn(self.store.store_server_verify_key)(
+                run_in_background(
+                    self.store.store_server_verify_key,
                     server_name, server_name, key.time_added, key
                 )
                 for key_id, key in verify_keys.items()
@@ -727,6 +657,17 @@ class Keyring(object):
 
 @defer.inlineCallbacks
 def _handle_key_deferred(verify_request):
+    """Waits for the key to become available, and then performs a verification
+
+    Args:
+        verify_request (VerifyKeyRequest):
+
+    Returns:
+        Deferred[None]
+
+    Raises:
+        SynapseError if there was a problem performing the verification
+    """
     server_name = verify_request.server_name
     try:
         with PreserveLoggingContext():
@@ -759,11 +700,17 @@ def _handle_key_deferred(verify_request):
     ))
     try:
         verify_signed_json(json_object, server_name, verify_key)
-    except Exception:
+    except SignatureVerifyException as e:
+        logger.debug(
+            "Error verifying signature for %s:%s:%s with key %s: %s",
+            server_name, verify_key.alg, verify_key.version,
+            encode_verify_key_base64(verify_key),
+            str(e),
+        )
         raise SynapseError(
             401,
-            "Invalid signature for server %s with key %s:%s" % (
-                server_name, verify_key.alg, verify_key.version
+            "Invalid signature for server %s with key %s:%s: %s" % (
+                server_name, verify_key.alg, verify_key.version, str(e),
             ),
             Codes.UNAUTHORIZED,
         )

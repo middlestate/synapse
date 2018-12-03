@@ -13,33 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+
+from six import itervalues
+
+from prometheus_client import Counter
+
 from twisted.internet import defer
 
 import synapse
 from synapse.api.constants import EventTypes
-from synapse.util.metrics import Measure
-from synapse.util.logcontext import (
-    make_deferred_yieldable, preserve_fn, run_in_background,
+from synapse.metrics import (
+    event_processing_loop_counter,
+    event_processing_loop_room_count,
 )
-
-import logging
+from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.util import log_failure
+from synapse.util.logcontext import make_deferred_yieldable, run_in_background
+from synapse.util.metrics import Measure
 
 logger = logging.getLogger(__name__)
 
-metrics = synapse.metrics.get_metrics_for(__name__)
-
-events_processed_counter = metrics.register_counter("events_processed")
-
-
-def log_failure(failure):
-    logger.error(
-        "Application Services Failure",
-        exc_info=(
-            failure.type,
-            failure.value,
-            failure.getTracebackObject()
-        )
-    )
+events_processed_counter = Counter("synapse_handlers_appservice_events_processed", "")
 
 
 class ApplicationServicesHandler(object):
@@ -106,14 +101,17 @@ class ApplicationServicesHandler(object):
                             yield self._check_user_exists(event.state_key)
 
                         if not self.started_scheduler:
-                            self.scheduler.start().addErrback(log_failure)
+                            def start_scheduler():
+                                return self.scheduler.start().addErrback(
+                                    log_failure, "Application Services Failure",
+                                )
+
+                            run_as_background_process("as_scheduler", start_scheduler)
                             self.started_scheduler = True
 
                         # Fork off pushes to these services
                         for service in services:
-                            preserve_fn(self.scheduler.submit_event_for_as)(
-                                service, event
-                            )
+                            self.scheduler.submit_event_for_as(service, event)
 
                     @defer.inlineCallbacks
                     def handle_room_events(events):
@@ -122,7 +120,7 @@ class ApplicationServicesHandler(object):
 
                     yield make_deferred_yieldable(defer.gatherResults([
                         run_in_background(handle_room_events, evs)
-                        for evs in events_by_room.itervalues()
+                        for evs in itervalues(events_by_room)
                     ], consumeErrors=True))
 
                     yield self.store.set_appservice_last_pos(upper_bound)
@@ -130,18 +128,21 @@ class ApplicationServicesHandler(object):
                     now = self.clock.time_msec()
                     ts = yield self.store.get_received_ts(events[-1].event_id)
 
-                    synapse.metrics.event_processing_positions.set(
-                        upper_bound, "appservice_sender",
-                    )
+                    synapse.metrics.event_processing_positions.labels(
+                        "appservice_sender").set(upper_bound)
 
-                    events_processed_counter.inc_by(len(events))
+                    events_processed_counter.inc(len(events))
 
-                    synapse.metrics.event_processing_lag.set(
-                        now - ts, "appservice_sender",
-                    )
-                    synapse.metrics.event_processing_last_ts.set(
-                        ts, "appservice_sender",
-                    )
+                    event_processing_loop_room_count.labels(
+                        "appservice_sender"
+                    ).inc(len(events_by_room))
+
+                    event_processing_loop_counter.labels("appservice_sender").inc()
+
+                    synapse.metrics.event_processing_lag.labels(
+                        "appservice_sender").set(now - ts)
+                    synapse.metrics.event_processing_last_ts.labels(
+                        "appservice_sender").set(ts)
             finally:
                 self.is_processing = False
 
@@ -198,7 +199,10 @@ class ApplicationServicesHandler(object):
         services = yield self._get_services_for_3pn(protocol)
 
         results = yield make_deferred_yieldable(defer.DeferredList([
-            preserve_fn(self.appservice_api.query_3pe)(service, kind, protocol, fields)
+            run_in_background(
+                self.appservice_api.query_3pe,
+                service, kind, protocol, fields,
+            )
             for service in services
         ], consumeErrors=True))
 
@@ -259,11 +263,15 @@ class ApplicationServicesHandler(object):
             event based on the service regex.
         """
         services = self.store.get_app_services()
-        interested_list = [
-            s for s in services if (
-                yield s.is_interested(event, self.store)
-            )
-        ]
+
+        # we can't use a list comprehension here. Since python 3, list
+        # comprehensions use a generator internally. This means you can't yield
+        # inside of a list comprehension anymore.
+        interested_list = []
+        for s in services:
+            if (yield s.is_interested(event, self.store)):
+                interested_list.append(s)
+
         defer.returnValue(interested_list)
 
     def _get_services_for_user(self, user_id):

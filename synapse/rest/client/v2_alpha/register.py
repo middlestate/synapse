@@ -14,27 +14,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hmac
+import logging
+from hashlib import sha1
+
+from six import string_types
+
 from twisted.internet import defer
 
 import synapse
 import synapse.types
-from synapse.api.auth import get_access_token_from_request, has_access_token
 from synapse.api.constants import LoginType
-from synapse.api.errors import SynapseError, Codes, UnrecognizedRequestError
+from synapse.api.errors import Codes, SynapseError, UnrecognizedRequestError
+from synapse.config.server import is_threepid_reserved
 from synapse.http.servlet import (
-    RestServlet, parse_json_object_from_request, assert_params_in_request, parse_string
+    RestServlet,
+    assert_params_in_dict,
+    parse_json_object_from_request,
+    parse_string,
 )
 from synapse.util.msisdn import phone_number_to_msisdn
+from synapse.util.ratelimitutils import FederationRateLimiter
 from synapse.util.threepids import check_3pid_allowed
 
 from ._base import client_v2_patterns, interactive_auth_handler
-
-import logging
-import hmac
-from hashlib import sha1
-from synapse.util.async import run_on_reactor
-from synapse.util.ratelimitutils import FederationRateLimiter
-
 
 # We ought to be using hmac.compare_digest() but on older pythons it doesn't
 # exist. It's a _really minor_ security flaw to use plain string comparison
@@ -66,13 +69,15 @@ class EmailRegisterRequestTokenRestServlet(RestServlet):
     def on_POST(self, request):
         body = parse_json_object_from_request(request)
 
-        assert_params_in_request(body, [
+        assert_params_in_dict(body, [
             'id_server', 'client_secret', 'email', 'send_attempt'
         ])
 
         if not check_3pid_allowed(self.hs, "email", body['email']):
             raise SynapseError(
-                403, "Third party identifier is not allowed", Codes.THREEPID_DENIED,
+                403,
+                "Your email domain is not authorized to register on this server",
+                Codes.THREEPID_DENIED,
             )
 
         existingUid = yield self.hs.get_datastore().get_user_id_by_threepid(
@@ -102,7 +107,7 @@ class MsisdnRegisterRequestTokenRestServlet(RestServlet):
     def on_POST(self, request):
         body = parse_json_object_from_request(request)
 
-        assert_params_in_request(body, [
+        assert_params_in_dict(body, [
             'id_server', 'client_secret',
             'country', 'phone_number',
             'send_attempt',
@@ -112,7 +117,9 @@ class MsisdnRegisterRequestTokenRestServlet(RestServlet):
 
         if not check_3pid_allowed(self.hs, "msisdn", msisdn):
             raise SynapseError(
-                403, "Third party identifier is not allowed", Codes.THREEPID_DENIED,
+                403,
+                "Phone numbers are not authorized to register on this server",
+                Codes.THREEPID_DENIED,
             )
 
         existingUid = yield self.hs.get_datastore().get_user_id_by_threepid(
@@ -189,19 +196,17 @@ class RegisterRestServlet(RestServlet):
     @interactive_auth_handler
     @defer.inlineCallbacks
     def on_POST(self, request):
-        yield run_on_reactor()
-
         body = parse_json_object_from_request(request)
 
-        kind = "user"
-        if "kind" in request.args:
-            kind = request.args["kind"][0]
+        kind = b"user"
+        if b"kind" in request.args:
+            kind = request.args[b"kind"][0]
 
-        if kind == "guest":
+        if kind == b"guest":
             ret = yield self._do_guest_registration(body)
             defer.returnValue(ret)
             return
-        elif kind != "user":
+        elif kind != b"user":
             raise UnrecognizedRequestError(
                 "Do not understand membership kind: %s" % (kind,)
             )
@@ -210,20 +215,20 @@ class RegisterRestServlet(RestServlet):
         # in sessions. Pull out the username/password provided to us.
         desired_password = None
         if 'password' in body:
-            if (not isinstance(body['password'], basestring) or
+            if (not isinstance(body['password'], string_types) or
                     len(body['password']) > 512):
                 raise SynapseError(400, "Invalid password")
             desired_password = body["password"]
 
         desired_username = None
         if 'username' in body:
-            if (not isinstance(body['username'], basestring) or
+            if (not isinstance(body['username'], string_types) or
                     len(body['username']) > 512):
                 raise SynapseError(400, "Invalid username")
             desired_username = body['username']
 
         appservice = None
-        if has_access_token(request):
+        if self.auth.has_access_token(request):
             appservice = yield self.auth.get_appservice_by_req(request)
 
         # fork off as soon as possible for ASes and shared secret auth which
@@ -241,9 +246,9 @@ class RegisterRestServlet(RestServlet):
             # because the IRC bridges rely on being able to register stupid
             # IDs.
 
-            access_token = get_access_token_from_request(request)
+            access_token = self.auth.get_access_token_from_request(request)
 
-            if isinstance(desired_username, basestring):
+            if isinstance(desired_username, string_types):
                 result = yield self._do_appservice_registration(
                     desired_username, access_token, body
                 )
@@ -354,6 +359,13 @@ class RegisterRestServlet(RestServlet):
                     [LoginType.MSISDN, LoginType.EMAIL_IDENTITY]
                 ])
 
+        # Append m.login.terms to all flows if we're requiring consent
+        if self.hs.config.user_consent_at_registration:
+            new_flows = []
+            for flow in flows:
+                flow.append(LoginType.TERMS)
+            flows.extend(new_flows)
+
         auth_result, params, session_id = yield self.auth_handler.check_auth(
             flows, body, self.hs.get_ip_from_request(request)
         )
@@ -372,7 +384,9 @@ class RegisterRestServlet(RestServlet):
 
                     if not check_3pid_allowed(self.hs, medium, address):
                         raise SynapseError(
-                            403, "Third party identifier is not allowed",
+                            403,
+                            "Third party identifiers (email/phone numbers)" +
+                            " are not authorized on this server",
                             Codes.THREEPID_DENIED,
                         )
 
@@ -386,23 +400,30 @@ class RegisterRestServlet(RestServlet):
             add_msisdn = False
         else:
             # NB: This may be from the auth handler and NOT from the POST
-            if 'password' not in params:
-                raise SynapseError(400, "Missing password.",
-                                   Codes.MISSING_PARAM)
+            assert_params_in_dict(params, ["password"])
 
             desired_username = params.get("username", None)
-            new_password = params.get("password", None)
             guest_access_token = params.get("guest_access_token", None)
+            new_password = params.get("password", None)
 
             if desired_username is not None:
                 desired_username = desired_username.lower()
+
+            threepid = None
+            if auth_result:
+                threepid = auth_result.get(LoginType.EMAIL_IDENTITY)
 
             (registered_user_id, _) = yield self.registration_handler.register(
                 localpart=desired_username,
                 password=new_password,
                 guest_access_token=guest_access_token,
                 generate_token=False,
+                threepid=threepid,
             )
+            # Necessary due to auth checks prior to the threepid being
+            # written to the db
+            if is_threepid_reserved(self.hs.config, threepid):
+                yield self.store.upsert_monthly_active_user(registered_user_id)
 
             # remember that we've now registered that user account, and with
             #  what user ID (since the user may not have specified)
@@ -429,6 +450,12 @@ class RegisterRestServlet(RestServlet):
             yield self._register_msisdn_threepid(
                 registered_user_id, threepid, return_dict["access_token"],
                 params.get("bind_msisdn")
+            )
+
+        if auth_result and LoginType.TERMS in auth_result:
+            logger.info("%s has consented to the privacy policy" % registered_user_id)
+            yield self.store.user_set_consent_version(
+                registered_user_id, self.hs.config.user_consent_version,
             )
 
         defer.returnValue((200, return_dict))
@@ -464,7 +491,7 @@ class RegisterRestServlet(RestServlet):
         # includes the password and admin flag in the hashed text. Why are
         # these different?
         want_mac = hmac.new(
-            key=self.hs.config.registration_shared_secret,
+            key=self.hs.config.registration_shared_secret.encode(),
             msg=user,
             digestmod=sha1,
         ).hexdigest()
@@ -565,11 +592,14 @@ class RegisterRestServlet(RestServlet):
         Returns:
             defer.Deferred:
         """
-        reqd = ('medium', 'address', 'validated_at')
-        if any(x not in threepid for x in reqd):
-            # This will only happen if the ID server returns a malformed response
-            logger.info("Can't add incomplete 3pid")
-            defer.returnValue()
+        try:
+            assert_params_in_dict(threepid, ['medium', 'address', 'validated_at'])
+        except SynapseError as ex:
+            if ex.errcode == Codes.MISSING_PARAM:
+                # This will only happen if the ID server returns a malformed response
+                logger.info("Can't add incomplete 3pid")
+                defer.returnValue(None)
+            raise
 
         yield self.auth_handler.add_threepid(
             user_id,
@@ -642,7 +672,7 @@ class RegisterRestServlet(RestServlet):
     @defer.inlineCallbacks
     def _do_guest_registration(self, params):
         if not self.hs.config.allow_guest_access:
-            defer.returnValue((403, "Guest access is disabled"))
+            raise SynapseError(403, "Guest access is disabled")
         user_id, _ = yield self.registration_handler.register(
             generate_token=False,
             make_guest=True

@@ -13,23 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+from collections import namedtuple
+
+from six import PY3, iteritems
+from six.moves import range
+
+import msgpack
+from unpaddedbase64 import decode_base64, encode_base64
+
 from twisted.internet import defer
 
-from ._base import BaseHandler
-
-from synapse.api.constants import (
-    EventTypes, JoinRules,
-)
-from synapse.util.async import concurrently_execute
+from synapse.api.constants import EventTypes, JoinRules
+from synapse.types import ThirdPartyInstanceID
+from synapse.util.async_helpers import concurrently_execute
 from synapse.util.caches.descriptors import cachedInlineCallbacks
 from synapse.util.caches.response_cache import ResponseCache
-from synapse.types import ThirdPartyInstanceID
 
-from collections import namedtuple
-from unpaddedbase64 import encode_base64, decode_base64
-
-import logging
-import msgpack
+from ._base import BaseHandler
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ REMOTE_ROOM_LIST_POLL_INTERVAL = 60 * 1000
 
 
 # This is used to indicate we should only return rooms published to the main list.
-EMTPY_THIRD_PARTY_ID = ThirdPartyInstanceID(None, None)
+EMPTY_THIRD_PARTY_ID = ThirdPartyInstanceID(None, None)
 
 
 class RoomListHandler(BaseHandler):
@@ -49,7 +50,7 @@ class RoomListHandler(BaseHandler):
 
     def get_local_public_room_list(self, limit=None, since_token=None,
                                    search_filter=None,
-                                   network_tuple=EMTPY_THIRD_PARTY_ID,):
+                                   network_tuple=EMPTY_THIRD_PARTY_ID,):
         """Generate a local public room list.
 
         There are multiple different lists: the main one plus one per third
@@ -86,7 +87,7 @@ class RoomListHandler(BaseHandler):
     @defer.inlineCallbacks
     def _get_public_room_list(self, limit=None, since_token=None,
                               search_filter=None,
-                              network_tuple=EMTPY_THIRD_PARTY_ID,):
+                              network_tuple=EMPTY_THIRD_PARTY_ID,):
         if since_token and since_token != "END":
             since_token = RoomListNextBatch.from_token(since_token)
         else:
@@ -161,7 +162,7 @@ class RoomListHandler(BaseHandler):
         # Filter out rooms that we don't want to return
         rooms_to_scan = [
             r for r in sorted_rooms
-            if r not in newly_unpublished and rooms_to_num_joined[room_id] > 0
+            if r not in newly_unpublished and rooms_to_num_joined[r] > 0
         ]
 
         total_room_count = len(rooms_to_scan)
@@ -200,7 +201,7 @@ class RoomListHandler(BaseHandler):
             step = len(rooms_to_scan) if len(rooms_to_scan) != 0 else 1
 
         chunk = []
-        for i in xrange(0, len(rooms_to_scan), step):
+        for i in range(0, len(rooms_to_scan), step):
             batch = rooms_to_scan[i:i + step]
             logger.info("Processing %i rooms for result", len(batch))
             yield concurrently_execute(
@@ -305,7 +306,7 @@ class RoomListHandler(BaseHandler):
         )
 
         event_map = yield self.store.get_events([
-            event_id for key, event_id in current_state_ids.iteritems()
+            event_id for key, event_id in iteritems(current_state_ids)
             if key[0] in (
                 EventTypes.JoinRules,
                 EventTypes.Name,
@@ -443,9 +444,16 @@ class RoomListNextBatch(namedtuple("RoomListNextBatch", (
 
     @classmethod
     def from_token(cls, token):
+        if PY3:
+            # The argument raw=False is only available on new versions of
+            # msgpack, and only really needed on Python 3. Gate it behind
+            # a PY3 check to avoid causing issues on Debian-packaged versions.
+            decoded = msgpack.loads(decode_base64(token), raw=False)
+        else:
+            decoded = msgpack.loads(decode_base64(token))
         return RoomListNextBatch(**{
             cls.REVERSE_KEY_DICT[key]: val
-            for key, val in msgpack.loads(decode_base64(token)).items()
+            for key, val in decoded.items()
         })
 
     def to_token(self):
